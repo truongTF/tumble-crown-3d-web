@@ -92,7 +92,140 @@ body {
 		</style>
 		<link id="-gd-engine-icon" rel="icon" type="image/png" href="index.icon.png" />
 <link rel="apple-touch-icon" href="index.apple-touch-icon.png"/>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+window.TumbleNet = (function () {
+  var peer = null;
+  var conns = {};
+  var hostConn = null;
+  var queue = [];
+  var currentCode = '';
+  var isHost = false;
+  var peerConfig = {
+    config: {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun.cloudflare.com:3478' }
+      ]
+    }
+  };
 
+  function pushEv(ev) { queue.push(ev); }
+
+  function decodeB64(b64) {
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return JSON.parse(new TextDecoder('utf-8').decode(bytes));
+  }
+
+  function cleanup() {
+    Object.keys(conns).forEach(function (k) { try { conns[k].close(); } catch (e) {} });
+    conns = {};
+    if (hostConn) { try { hostConn.close(); } catch (e) {} hostConn = null; }
+    if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
+    currentCode = '';
+    isHost = false;
+  }
+
+  return {
+    getInitialRoom: function () {
+      try {
+        var params = new URLSearchParams(window.location.search);
+        return params.get('room') || '';
+      } catch (e) { return ''; }
+    },
+    getInviteUrl: function () {
+      return window.location.origin + window.location.pathname + '?room=' + encodeURIComponent(currentCode);
+    },
+    copyInviteUrl: function () {
+      var u = this.getInviteUrl();
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(u).catch(function () {});
+      }
+    },
+    createRoom: function (code, name, skin) {
+      cleanup();
+      isHost = true;
+      currentCode = String(code);
+      if (typeof Peer === 'undefined') {
+        pushEv({ type: 'error', message: 'Không tải được thư viện PeerJS!' });
+        return;
+      }
+      peer = new Peer('tc3d-' + currentCode, peerConfig);
+      peer.on('open', function () {
+        pushEv({ type: 'created', code: currentCode });
+      });
+      peer.on('connection', function (conn) {
+        conn.on('data', function (raw) {
+          if (raw && raw.t === 'hello') {
+            conns[conn.peer] = conn;
+            pushEv({ type: 'peer_join', peerId: conn.peer, name: raw.name || 'Friend', skin: raw.skin || 1 });
+          } else {
+            pushEv({ type: 'msg', from: conn.peer, data: raw });
+          }
+        });
+        conn.on('close', function () {
+          delete conns[conn.peer];
+          pushEv({ type: 'peer_leave', peerId: conn.peer });
+        });
+      });
+      peer.on('error', function (err) {
+        pushEv({ type: 'error', message: 'Lỗi tạo phòng: ' + (err.type || err.message || err) });
+      });
+    },
+    joinRoom: function (code, name, skin) {
+      cleanup();
+      isHost = false;
+      currentCode = String(code).trim();
+      if (typeof Peer === 'undefined') {
+        pushEv({ type: 'error', message: 'Không tải được thư viện PeerJS!' });
+        return;
+      }
+      peer = new Peer(undefined, peerConfig);
+      peer.on('open', function (myId) {
+        hostConn = peer.connect('tc3d-' + currentCode, { reliable: false });
+        hostConn.on('open', function () {
+          hostConn.send({ t: 'hello', name: name, skin: skin });
+          pushEv({ type: 'joined', peerId: myId });
+        });
+        hostConn.on('data', function (raw) {
+          pushEv({ type: 'msg', from: 'host', data: raw });
+        });
+        hostConn.on('close', function () {
+          pushEv({ type: 'disconnected' });
+        });
+        hostConn.on('error', function (err) {
+          pushEv({ type: 'error', message: 'Không kết nối được phòng ' + currentCode });
+        });
+      });
+      peer.on('error', function (err) {
+        pushEv({ type: 'error', message: 'Lỗi vào phòng: ' + (err.type || err.message || err) });
+      });
+    },
+    leaveRoom: function () { cleanup(); },
+    sendToAllB64: function (b64) {
+      if (!isHost) return;
+      try {
+        var obj = decodeB64(b64);
+        Object.keys(conns).forEach(function (k) {
+          if (conns[k] && conns[k].open) conns[k].send(obj);
+        });
+      } catch (e) {}
+    },
+    sendToHostB64: function (b64) {
+      if (isHost || !hostConn || !hostConn.open) return;
+      try { hostConn.send(decodeB64(b64)); } catch (e) {}
+    },
+    poll: function () {
+      if (queue.length === 0) return '[]';
+      var out = queue.splice(0, queue.length);
+      return JSON.stringify(out);
+    }
+  };
+})();
+</script>
 	</head>
 	<body>
 		<canvas id="canvas">
@@ -111,7 +244,7 @@ body {
 
 		<script src="index.js"></script>
 		<script>
-const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":48504,"index.wasm":39514754},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":66244,"index.wasm":39514754},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
 const GODOT_THREADS_ENABLED = false;
 const engine = new Engine(GODOT_CONFIG);
 

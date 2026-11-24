@@ -92,24 +92,17 @@ body {
 		</style>
 		<link id="-gd-engine-icon" rel="icon" type="image/png" href="index.icon.png" />
 <link rel="apple-touch-icon" href="index.apple-touch-icon.png"/>
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script>
 window.TumbleNet = (function () {
-  var peer = null;
-  var conns = {};
-  var hostConn = null;
+  var client = null;
   var queue = [];
   var currentCode = '';
   var isHost = false;
-  var peerConfig = {
-    config: {
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun.cloudflare.com:3478' }
-      ]
-    }
-  };
+  var myId = 'host';
+  var gotRoster = false;
+  var helloTimer = null;
+  var BROKER = 'wss://broker.emqx.io:8084/mqtt';
 
   function pushEv(ev) { queue.push(ev); }
 
@@ -121,12 +114,20 @@ window.TumbleNet = (function () {
   }
 
   function cleanup() {
-    Object.keys(conns).forEach(function (k) { try { conns[k].close(); } catch (e) {} });
-    conns = {};
-    if (hostConn) { try { hostConn.close(); } catch (e) {} hostConn = null; }
-    if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
+    if (helloTimer) { clearInterval(helloTimer); helloTimer = null; }
+    if (client) {
+      try {
+        if (!isHost && currentCode) {
+          client.publish('tc3d/v1/' + currentCode + '/h', JSON.stringify({ t: 'bye', pid: myId }));
+        }
+        client.end(true);
+      } catch (e) {}
+      client = null;
+    }
     currentCode = '';
     isHost = false;
+    myId = 'host';
+    gotRoster = false;
   }
 
   return {
@@ -137,7 +138,7 @@ window.TumbleNet = (function () {
       } catch (e) { return ''; }
     },
     getInviteUrl: function () {
-      return window.location.origin + window.location.pathname + '?room=' + encodeURIComponent(currentCode);
+      return window.location.origin + window.location.pathname + '?room=' + encodeURIComponent(currentCode) + '&v=' + Date.now().toString().slice(-4);
     },
     copyInviteUrl: function () {
       var u = this.getInviteUrl();
@@ -148,75 +149,107 @@ window.TumbleNet = (function () {
     createRoom: function (code, name, skin) {
       cleanup();
       isHost = true;
-      currentCode = String(code);
-      if (typeof Peer === 'undefined') {
-        pushEv({ type: 'error', message: 'Không tải được thư viện PeerJS!' });
+      myId = 'host';
+      currentCode = String(code).trim();
+      if (typeof mqtt === 'undefined') {
+        pushEv({ type: 'error', message: 'Không tải được thư viện mạng MQTT!' });
         return;
       }
-      peer = new Peer('tc3d-' + currentCode, peerConfig);
-      peer.on('open', function () {
-        pushEv({ type: 'created', code: currentCode });
+      var topicH = 'tc3d/v1/' + currentCode + '/h';
+      client = mqtt.connect(BROKER, {
+        clientId: 'tc3d_h_' + currentCode + '_' + Math.random().toString(36).slice(2, 6),
+        clean: true,
+        connectTimeout: 8000,
+        reconnectPeriod: 1500
       });
-      peer.on('connection', function (conn) {
-        conn.on('data', function (raw) {
-          if (raw && raw.t === 'hello') {
-            conns[conn.peer] = conn;
-            pushEv({ type: 'peer_join', peerId: conn.peer, name: raw.name || 'Friend', skin: raw.skin || 1 });
+      client.on('connect', function () {
+        client.subscribe(topicH, function (err) {
+          if (err) pushEv({ type: 'error', message: 'Lỗi tạo phòng: ' + err.message });
+          else pushEv({ type: 'created', code: currentCode });
+        });
+      });
+      client.on('message', function (_topic, payload) {
+        try {
+          var raw = JSON.parse(payload.toString());
+          if (!raw) return;
+          if (raw.t === 'hello') {
+            pushEv({ type: 'peer_join', peerId: raw.pid, name: raw.name || 'Friend', skin: raw.skin || 1 });
+          } else if (raw.t === 'bye') {
+            pushEv({ type: 'peer_leave', peerId: raw.pid });
           } else {
-            pushEv({ type: 'msg', from: conn.peer, data: raw });
+            pushEv({ type: 'msg', from: raw.pid || '', data: raw });
           }
-        });
-        conn.on('close', function () {
-          delete conns[conn.peer];
-          pushEv({ type: 'peer_leave', peerId: conn.peer });
-        });
+        } catch (e) {}
       });
-      peer.on('error', function (err) {
-        pushEv({ type: 'error', message: 'Lỗi tạo phòng: ' + (err.type || err.message || err) });
+      client.on('error', function (err) {
+        pushEv({ type: 'error', message: 'Lỗi mạng: ' + (err.message || err) });
       });
     },
     joinRoom: function (code, name, skin) {
       cleanup();
       isHost = false;
       currentCode = String(code).trim();
-      if (typeof Peer === 'undefined') {
-        pushEv({ type: 'error', message: 'Không tải được thư viện PeerJS!' });
+      myId = 'p_' + Math.random().toString(36).slice(2, 8);
+      if (typeof mqtt === 'undefined') {
+        pushEv({ type: 'error', message: 'Không tải được thư viện mạng MQTT!' });
         return;
       }
-      peer = new Peer(undefined, peerConfig);
-      peer.on('open', function (myId) {
-        hostConn = peer.connect('tc3d-' + currentCode, { reliable: false });
-        hostConn.on('open', function () {
-          hostConn.send({ t: 'hello', name: name, skin: skin });
+      var topicH = 'tc3d/v1/' + currentCode + '/h';
+      var topicC = 'tc3d/v1/' + currentCode + '/c';
+      client = mqtt.connect(BROKER, {
+        clientId: 'tc3d_c_' + myId,
+        clean: true,
+        connectTimeout: 8000,
+        reconnectPeriod: 1500
+      });
+      function sendHello() {
+        if (client && client.connected) {
+          client.publish(topicH, JSON.stringify({ t: 'hello', pid: myId, name: name, skin: skin }));
+        }
+      }
+      client.on('connect', function () {
+        client.subscribe(topicC, function (err) {
+          if (err) {
+            pushEv({ type: 'error', message: 'Không vào được phòng ' + currentCode });
+            return;
+          }
           pushEv({ type: 'joined', peerId: myId });
-        });
-        hostConn.on('data', function (raw) {
-          pushEv({ type: 'msg', from: 'host', data: raw });
-        });
-        hostConn.on('close', function () {
-          pushEv({ type: 'disconnected' });
-        });
-        hostConn.on('error', function (err) {
-          pushEv({ type: 'error', message: 'Không kết nối được phòng ' + currentCode });
+          sendHello();
+          var tries = 0;
+          helloTimer = setInterval(function () {
+            tries++;
+            if (gotRoster || tries >= 5) { clearInterval(helloTimer); helloTimer = null; return; }
+            sendHello();
+          }, 800);
         });
       });
-      peer.on('error', function (err) {
-        pushEv({ type: 'error', message: 'Lỗi vào phòng: ' + (err.type || err.message || err) });
+      client.on('message', function (_topic, payload) {
+        try {
+          var raw = JSON.parse(payload.toString());
+          if (!raw) return;
+          if (raw.t === 'roster') gotRoster = true;
+          pushEv({ type: 'msg', from: 'host', data: raw });
+        } catch (e) {}
+      });
+      client.on('error', function (err) {
+        pushEv({ type: 'error', message: 'Lỗi vào phòng: ' + (err.message || err) });
       });
     },
     leaveRoom: function () { cleanup(); },
     sendToAllB64: function (b64) {
-      if (!isHost) return;
+      if (!isHost || !client || !client.connected || !currentCode) return;
       try {
         var obj = decodeB64(b64);
-        Object.keys(conns).forEach(function (k) {
-          if (conns[k] && conns[k].open) conns[k].send(obj);
-        });
+        client.publish('tc3d/v1/' + currentCode + '/c', JSON.stringify(obj));
       } catch (e) {}
     },
     sendToHostB64: function (b64) {
-      if (isHost || !hostConn || !hostConn.open) return;
-      try { hostConn.send(decodeB64(b64)); } catch (e) {}
+      if (isHost || !client || !client.connected || !currentCode) return;
+      try {
+        var obj = decodeB64(b64);
+        obj.pid = myId;
+        client.publish('tc3d/v1/' + currentCode + '/h', JSON.stringify(obj));
+      } catch (e) {}
     },
     poll: function () {
       if (queue.length === 0) return '[]';
